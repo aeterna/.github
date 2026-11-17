@@ -1,0 +1,108 @@
+# AETERNA org checks — reusable workflow (plan "Rules → Checks" W1/L6 · AGENTS.md §7.1 §11.1 §12.4).
+# A repo adopts it with a caller job (no root-level `paths:` there either):
+#
+#   jobs:
+#     org-checks:
+#       uses: aeterna/.github/.github/workflows/org-checks.yml@<sha>
+#       with:
+#         public: true                 # public repos: refuse SEC-ADV references (§12.4)
+#         paths-allowlist: ""          # workflow files allowed a root paths: filter (never one that feeds a required check)
+#         claude-md-max: 150           # CLAUDE.md line ceiling (§7.1: a pointer, not a rule store)
+#
+# Every check is fast and needs no secrets. A failing check names the rule and how to fix it.
+name: org-checks
+
+on:
+  workflow_call:
+    inputs:
+      public:
+        description: "repo is public: refuse SEC-ADV / security-tickets references in the PR (AGENTS §12.4)"
+        type: boolean
+        default: false
+      paths-allowlist:
+        description: "space-separated workflow file names allowed a root-level paths/paths-ignore filter"
+        type: string
+        default: ""
+      claude-md-max:
+        description: "maximum lines in the root CLAUDE.md (0 = skip)"
+        type: number
+        default: 150
+
+permissions:
+  contents: read
+
+jobs:
+  org-checks:
+    name: org-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: "§11.1 no root-level paths filter on workflows"
+        env:
+          ALLOW: ${{ inputs.paths-allowlist }}
+        run: |
+          python3 - <<'EOF'
+          import os, pathlib, re, sys
+          allow = set(os.environ.get("ALLOW", "").split())
+          bad = []
+          for f in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              if f.name in allow:
+                  continue
+              text = f.read_text(encoding="utf-8")
+              # Only the trigger block counts: lines indented under a top-level `on:` key, before the next top-level key.
+              trig, inside = [], False
+              for line in text.splitlines():
+                  if re.match(r"^(on|\"on\"|'on')\s*:", line):
+                      inside = True
+                      continue
+                  if inside and re.match(r"^\S", line) and not line.startswith("#"):
+                      break
+                  if inside:
+                      trig.append(line)
+              hits = [l.strip() for l in trig if re.match(r"^\s+(paths|paths-ignore)\s*:", l)]
+              if hits:
+                  bad.append(f"{f}: {', '.join(hits)}")
+          if bad:
+              print("::error title=AGENTS §11.1::a root-level paths filter leaves a required check waiting forever when the diff misses it")
+              print("\n".join(bad))
+              print("fix: drop the filter and exit early inside the job (job-level fast-pass), or add the file to paths-allowlist if no required check comes from it")
+              sys.exit(1)
+          print("ok: no root-level paths filter")
+          EOF
+
+      - name: "§7.1 CLAUDE.md stays a short pointer"
+        env:
+          MAX: ${{ inputs.claude-md-max }}
+        run: |
+          if [ "$MAX" = "0" ] || [ ! -f CLAUDE.md ]; then echo "skipped"; exit 0; fi
+          n=$(wc -l < CLAUDE.md)
+          if [ "$n" -gt "$MAX" ]; then
+            echo "::error title=AGENTS §7.1::CLAUDE.md has $n lines (max $MAX) — move rules to their one owner and point to it"
+            exit 1
+          fi
+          echo "ok: CLAUDE.md $n/$MAX lines"
+
+      - name: "§12.4 no security case references in a public repo"
+        if: ${{ inputs.public && github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          pattern='SEC-ADV-[0-9]+|aeterna/security-tickets|security-tickets/(issues|pull)'
+          found=0
+          if printf '%s\n%s\n' "$TITLE" "$BODY" | grep -Eqi "$pattern"; then echo "PR title or body"; found=1; fi
+          if git log --format=%B "$BASE..$HEAD" | grep -Eqi "$pattern"; then echo "a commit message"; found=1; fi
+          if git diff "$BASE...$HEAD" | grep -E '^\+' | grep -Eqi "$pattern"; then echo "an added line in the diff"; found=1; fi
+          if [ "$found" -ne 0 ]; then
+            echo "::error title=AGENTS §12.4::a public repo must not name a security case — keep the PR ↔ case link only in the security-tickets issue comment"
+            exit 1
+          fi
+          echo "ok: no security case reference"
